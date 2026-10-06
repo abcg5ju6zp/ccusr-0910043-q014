@@ -42,6 +42,28 @@ class KernelWebsocketHandler(WebSocketMixin, WebSocketHandler, JupyterHandler):
             raise web.HTTPError(403)
 
         kernel = self.kernel_manager.get_kernel(self.kernel_id)
+
+        # Ownership fence: never attach our channels to a kernel whose
+        # generationed lease belongs to another server process.  Recovery
+        # (or the owning server shutting down) will eventually transfer the
+        # lease, at which point the client's reconnect attempt succeeds.
+        session_manager = self.settings.get("session_manager")
+        if session_manager is not None and hasattr(
+            session_manager, "authorize_kernel_connection"
+        ):
+            authorized_owner = await ensure_async(
+                session_manager.authorize_kernel_connection(
+                    self.kernel_id, self.get_argument("session_id", None)
+                )
+            )
+            if not authorized_owner:
+                self.log.warning(
+                    "Rejecting websocket for kernel %s: lease owned by another "
+                    "server generation.",
+                    self.kernel_id,
+                )
+                raise web.HTTPError(409, "Kernel is not owned by this server")
+
         self.connection = self.kernel_websocket_connection_class(
             parent=kernel, websocket_handler=self, config=self.config
         )

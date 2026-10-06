@@ -2593,7 +2593,29 @@ class ServerApp(JupyterApp):
         # binding sockets must be called from inside an event loop
         if not self.sock:
             self._find_http_port()
-        self.io_loop.add_callback(self._bind_http_server)
+        # Reconcile persisted session/kernel ownership *before* the server
+        # starts accepting connections, then bind.  Two servers recovering
+        # the same database are serialised by the lease compare-and-swap.
+        self.io_loop.add_callback(self._recover_then_bind)
+
+    async def _recover_then_bind(self) -> None:
+        """Run generationed-lease recovery before opening the socket."""
+        session_manager = getattr(self, "session_manager", None)
+        if session_manager is not None and hasattr(session_manager, "ensure_recovered"):
+            try:
+                summary = await session_manager.ensure_recovered()
+                if summary and any(summary.values()):
+                    self.log.info(
+                        "Session lease recovery: adopted=%s quarantined=%s "
+                        "cleaned=%s skipped=%s",
+                        len(summary.get("adopted", [])),
+                        len(summary.get("quarantined", [])),
+                        len(summary.get("cleaned", [])),
+                        len(summary.get("skipped", [])),
+                    )
+            except Exception:
+                self.log.exception("Session lease recovery failed; starting anyway.")
+        self._bind_http_server()
 
     def _bind_http_server(self) -> None:
         """项目内部接口说明。"""

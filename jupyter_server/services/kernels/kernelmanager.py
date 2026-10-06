@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import pathlib  # noqa: TC003
 import sys
@@ -15,6 +16,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from functools import partial, wraps
 
+import zmq
 from jupyter_client.ioloop.manager import AsyncIOLoopKernelManager
 from jupyter_client.multikernelmanager import AsyncMultiKernelManager, MultiKernelManager
 from jupyter_client.session import Session
@@ -22,6 +24,8 @@ from jupyter_core.paths import exists
 from jupyter_core.utils import ensure_async
 from jupyter_events import EventLogger
 from jupyter_events.schema_registry import SchemaRegistryException
+
+from jupyter_server.services.sessions.lease import compute_kernel_identity
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -51,6 +55,15 @@ from jupyter_server.prometheus.metrics import KERNEL_CURRENTLY_RUNNING_TOTAL
 from jupyter_server.utils import ApiPath, import_item, to_os_path
 
 
+class LeaseOwnershipLost(RuntimeError):
+    """Raised when a kernel shutdown is blocked because this process no
+    longer owns the kernel's generationed lease.
+
+    The caller must not retry the kill: another server/generation is
+    responsible for the kernel now.
+    """
+
+
 class MappingKernelManager(MultiKernelManager):
     """项目内部接口说明。"""
 
@@ -77,6 +90,9 @@ class MappingKernelManager(MultiKernelManager):
     _kernel_connections = Dict()
 
     _kernel_ports: dict[str, list[int]] = Dict()  # type: ignore[assignment]
+
+    #: lazily-created asyncio zmq context for recovery heartbeat probes
+    _probe_context: t.Any = None
 
     _culler_callback = None
 
@@ -155,7 +171,47 @@ class MappingKernelManager(MultiKernelManager):
         """,
     )
 
+    kernel_lease_probe_timeout = Float(
+        5.0,
+        config=True,
+        help="""Timeout (in seconds) for the heartbeat probe used while taking
+        over an orphaned kernel after a server crash.
+
+        The probe is the kernel's *proof of life*: a persisted session record
+        is only reclaimed once the kernel behind it either fails this probe or
+        cannot present the connection file at all.  Wall-clock lease expiry by
+        itself never triggers a kill.""",
+    )
+
     _kernel_buffers = Any()
+
+    #: sha256 connection-file fingerprints, keyed by kernel_id
+    _kernel_identities: dict[str, str]
+
+    #: kernel ids managed without owning the process (taken over on recovery)
+    _kernel_adopted: set[str]
+
+    #: kernel_id -> gate() coroutine/function returning True while *this*
+    #: process is the lease owner allowed to destroy the kernel
+    _kernel_lease_gates: dict[str, t.Any]
+
+    #: optional global gate(kernel_id) consulted when no per-kernel gate
+    #: is registered
+    _default_lease_gate: t.Any = None
+
+    #: optional callback(kernel_id, new_identity) fired after a restart
+    #: rewrites the connection file
+    _identity_changed_callback: t.Any = None
+
+    def set_default_lease_gate(self, gate: t.Any) -> None:
+        """Install a process-wide ownership predicate for kernel kills.
+
+        ``gate(kernel_id)`` returns True (possibly via a coroutine) while
+        this process may destroy the kernel.  It is consulted for every
+        terminal shutdown unless a more specific gate was registered with
+        :meth:`set_lease_gate`.
+        """
+        self._default_lease_gate = gate
 
     @default("_kernel_buffers")
     def _default_kernel_buffers(self):
@@ -170,6 +226,9 @@ class MappingKernelManager(MultiKernelManager):
         """项目内部接口说明。"""
         self.pinned_superclass = MultiKernelManager
         self._pending_kernel_tasks = {}
+        self._kernel_identities = getattr(self, "_kernel_identities", None) or {}
+        self._kernel_adopted = getattr(self, "_kernel_adopted", None) or set()
+        self._kernel_lease_gates = getattr(self, "_kernel_lease_gates", None) or {}
         self.pinned_superclass.__init__(self, **kwargs)
         self.last_kernel_activity = utcnow()
 
@@ -199,6 +258,10 @@ class MappingKernelManager(MultiKernelManager):
         """项目内部接口说明。"""
         self.log.warning("Kernel %s died, removing from map.", kernel_id)
         self.remove_kernel(kernel_id)
+        self._kernel_adopted.discard(kernel_id)
+        self._kernel_identities.pop(kernel_id, None)
+        self._kernel_ports.pop(kernel_id, None)
+        self._kernel_lease_gates.pop(kernel_id, None)
 
     def cwd_for_path(self, path, **kwargs):
         """项目内部接口说明。"""
@@ -221,6 +284,9 @@ class MappingKernelManager(MultiKernelManager):
         await super()._remove_kernel_when_ready(kernel_id, kernel_awaitable)
         self._kernel_connections.pop(kernel_id, None)
         self._kernel_ports.pop(kernel_id, None)
+        self._kernel_identities.pop(kernel_id, None)
+        self._kernel_lease_gates.pop(kernel_id, None)
+        self._kernel_adopted.discard(kernel_id)
 
     # TODO: DEC 2022: Revise the type-ignore once the signatures have been changed upstream
     # https://github.com/jupyter/jupyter_client/pull/905
@@ -275,6 +341,238 @@ class MappingKernelManager(MultiKernelManager):
     # in jupyter_client.
     start_kernel = _async_start_kernel  # type:ignore[assignment]
 
+    # ------------------------------------------------------------------
+    # generationed lease support: identity, adoption, ownership gate
+    # ------------------------------------------------------------------
+    def _connection_file_path(self, kernel_id: str) -> str:
+        return os.path.join(self.connection_dir, "kernel-%s.json" % kernel_id)
+
+    def _load_connection_info(self, kernel_id: str) -> dict[str, t.Any] | None:
+        """Read and parse a kernel connection file, or None if absent/bad."""
+        path = self._connection_file_path(kernel_id)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                return t.cast("dict[str, t.Any]", json.load(f))
+        except (OSError, json.JSONDecodeError):
+            self.log.warning("Unreadable kernel connection file for %s: %s", kernel_id, path)
+            return None
+
+    def read_kernel_identity(self, kernel_id: str) -> str | None:
+        """Return the persisted identity of a kernel, or None if no
+        connection file exists (kernel truly gone).
+
+        The identity is a hash of the five ZMQ ports and the signing key
+        recorded in ``kernel-<id>.json``; see
+        :func:`jupyter_server.services.sessions.lease.compute_kernel_identity`.
+        """
+        info = self._load_connection_info(kernel_id)
+        if info is None:
+            return None
+        return compute_kernel_identity(info)
+
+    def current_kernel_identity(self, kernel_id: str) -> str | None:
+        """Identity of a kernel this manager holds, computed live."""
+        km = self._kernels[kernel_id]
+        try:
+            return compute_kernel_identity(km.get_connection_info())
+        except Exception:
+            return self.read_kernel_identity(kernel_id)
+
+    async def probe_kernel(self, kernel_id: str, timeout: float | None = None) -> bool:
+        """Send a single heartbeat ping to an unattached kernel.
+
+        This is the *proof of life* used during recovery: success means
+        someone (a live peer server, a client) may still be talking to the
+        kernel, so an expired wall-clock fence must not be acted upon.
+        """
+        info = self._load_connection_info(kernel_id)
+        if info is None:
+            return False
+        try:
+            transport = info.get("transport", "tcp")
+            ip = info.get("ip", "127.0.0.1")
+            address = f"{transport}://{ip}:{info['hb_port']}"
+            # Use an asyncio ZMQ context so send/poll/recv are awaitable;
+            # reuse the multi-kernel-manager's context when available.
+            context = getattr(self, "context", None)
+            if context is None or not isinstance(context, zmq.asyncio.Context):
+                if MappingKernelManager._probe_context is None:
+                    MappingKernelManager._probe_context = zmq.asyncio.Context()
+                context = MappingKernelManager._probe_context
+            socket = context.socket(zmq.REQ)
+            socket.linger = 100
+            try:
+                socket.connect(address)
+                await socket.send(b"ping")
+                if await socket.poll((timeout or self.kernel_lease_probe_timeout) * 1000):
+                    await socket.recv()
+                    return True
+                return False
+            finally:
+                socket.close(linger=100)
+        except Exception as e:
+            self.log.debug("Heartbeat probe failed for kernel %s: %s", kernel_id, e)
+            return False
+
+    async def adopt_kernel(self, kernel_id: str, *, kernel_name: str | None = None) -> bool:
+        """Attach to an already-running kernel without launching a process.
+
+        Used when this server wins the lease take-over during recovery.
+        The kernel manager is constructed in non-owning mode
+        (``owns_kernel=False``): we can talk to the kernel and will delete
+        its session, but jupyter_client will never kill a process we did
+        not start.  Ownership of the process can only be proven by the
+        successful heartbeat probe performed by the caller.
+        """
+        if kernel_id in self:
+            return True
+        path = self._connection_file_path(kernel_id)
+        file_info = self._load_connection_info(kernel_id)
+        if file_info is None:
+            return False
+        constructor_kwargs: dict[str, t.Any] = {}
+        if self.kernel_spec_manager:
+            constructor_kwargs["kernel_spec_manager"] = self.kernel_spec_manager
+        kernel_name = file_info.get("kernel_name") or kernel_name or "python3"
+        km = self.kernel_manager_factory(
+            connection_file=path,
+            parent=self,
+            log=self.log,
+            kernel_name=kernel_name or "python3",
+            owns_kernel=False,
+            **constructor_kwargs,
+        )
+        try:
+            km.load_connection_file()
+        except Exception as e:
+            self.log.warning("Cannot adopt kernel %s: bad connection file: %s", kernel_id, e)
+            return False
+        # This manager never launched the process; mark its ready future
+        # done so the websocket/startup paths treat it as a live kernel.
+        ready = getattr(km, "ready", None)
+        if ready is not None and not ready.done():
+            if isinstance(ready, asyncio.Future):
+                ready.set_result(None)
+            else:
+                ready.set_result(None)
+        km.execution_state = "idle"  # type:ignore[attr-defined]
+        km.reason = ""  # type:ignore[attr-defined]
+        km.last_activity = utcnow()  # type:ignore[attr-defined]
+        km._jupyter_server_adopted = True  # type:ignore[attr-defined]
+        self._kernels[kernel_id] = km
+        self._kernel_adopted.add(kernel_id)
+        self._kernel_connections[kernel_id] = 0
+        self._kernel_identities[kernel_id] = self.read_kernel_identity(kernel_id) or ""
+        self.log.info("Took over orphaned kernel %s without restarting it.", kernel_id)
+        return True
+
+    async def _adopted_shutdown(self, km, *, now: bool, restart: bool) -> None:
+        """Shutdown a kernel adopted without a provisioner.
+
+        The kernel manager for an adopted kernel never launched the process
+        and has no provisioner, so the jupyter_client shutdown path (which
+        asserts on a provisioner and signals the process) cannot run.  Ask
+        the kernel to exit over the control channel instead; never signal a
+        foreign process.  If the kernel ignores the request it is left
+        running -- we only drop our attachment and remove the connection
+        file we were holding.
+        """
+        client = None
+        try:
+            client = km.client()
+            # Fire the shutdown_request on the control channel only.  The
+            # blocking client uses daemon threads and start/stop here are
+            # non-blocking; we poll the heartbeat asynchronously afterwards.
+            client.start_channels(shell=False, iopub=False, stdin=False, hb=False)
+            client.shutdown(restart=restart)
+        except Exception as e:
+            self.log.debug("Control-channel shutdown of adopted kernel failed: %s", e)
+        finally:
+            if client is not None:
+                try:
+                    client.stop_channels()
+                except Exception:
+                    pass
+        gone = await self._wait_for_kernel_exit(km.kernel_id, timeout=1.0 if now else 5.0)
+        if not gone:
+            self.log.warning(
+                "Adopted kernel %s did not confirm shutdown; leaving its process alone.",
+                km.kernel_id,
+            )
+        if not restart:
+            try:
+                km.cleanup_connection_file()
+            except Exception:
+                pass
+        try:
+            km.cleanup_ipc_files()
+        except Exception:
+            pass
+
+    async def _wait_for_kernel_exit(self, kernel_id: str, timeout: float = 5.0) -> bool:
+        """Poll the heartbeat port until the kernel stops answering."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.2)
+            if not await self.probe_kernel(kernel_id, timeout=0.5):
+                return True
+        return False
+
+    def abandon_kernel(self, kernel_id: str) -> None:
+        """Detach from an adopted kernel without signalling it.
+
+        Used when recovery decides not to take ownership (quarantine or a
+        lost race): the live kernel keeps running for whoever actually owns
+        it.
+        """
+        km = self._kernels.pop(kernel_id, None)
+        self._kernel_adopted.discard(kernel_id)
+        self._kernel_connections.pop(kernel_id, None)
+        self._kernel_ports.pop(kernel_id, None)
+        self._kernel_identities.pop(kernel_id, None)
+        self._kernel_lease_gates.pop(kernel_id, None)
+        if km is not None:
+            # Adopted managers never launch a process and, at adoption
+            # time, have opened no channels; just release the activity
+            # monitor if recovery happened to start one.  We deliberately
+            # do not call cleanup_resources(): on async managers it is a
+            # coroutine, and it also deletes the connection file, which
+            # still belongs to the live kernel we are abandoning.
+            activity_stream = getattr(km, "_activity_stream", None)
+            if activity_stream is not None and not activity_stream.socket.closed:
+                activity_stream.close()
+            km._activity_stream = None
+
+    def set_lease_gate(self, kernel_id: str, gate: t.Any) -> None:
+        """Register an ownership predicate for a single kernel.
+
+        ``gate(kernel_id)`` is a sync callable or coroutine function
+        returning True while this process is the current lease owner of
+        the kernel.  Shutdown consults it right before killing the
+        process, closing the window between a session delete decision and
+        the actual kill.
+        """
+        self._kernel_lease_gates[kernel_id] = gate
+
+    def clear_lease_gate(self, kernel_id: str) -> None:
+        self._kernel_lease_gates.pop(kernel_id, None)
+
+    async def _lease_allows_destroy(self, kernel_id: str) -> bool:
+        gate = self._kernel_lease_gates.get(kernel_id, self._default_lease_gate)
+        if gate is None:
+            # No gate registered: backwards-compatible behaviour.
+            return True
+        try:
+            result = gate(kernel_id)
+            if asyncio.iscoroutine(result):
+                result = await result
+        except Exception as e:
+            self.log.warning("Lease gate for kernel %s failed (%s); refusing to kill.", kernel_id, e)
+            return False
+        return bool(result)
+
     async def _finish_kernel_start(self, kernel_id):
         """项目内部接口说明。"""
         km = self.get_kernel(kernel_id)
@@ -291,6 +589,10 @@ class MappingKernelManager(MultiKernelManager):
         self.log.debug("Kernel %s ready", kernel_id)
 
         self._kernel_ports[kernel_id] = km.ports
+        # Record the kernel's identity from the freshly written connection
+        # file; recovery compares it against the persisted lease so a kernel
+        # restart that recycled ZMQ ports is never mistaken for the original.
+        self._kernel_identities[kernel_id] = self.read_kernel_identity(kernel_id) or ""
         self.start_watching_activity(kernel_id)
         # register callback for failed auto-restart
         self.add_restart_callback(
@@ -387,6 +689,18 @@ class MappingKernelManager(MultiKernelManager):
         """项目内部接口说明。"""
         self._check_kernel_id(kernel_id)
 
+        # A restart never changes who owns the kernel; only a terminal
+        # shutdown needs the fencing check, because that is where we might
+        # kill a peer server's kernel.
+        if not restart and not await self._lease_allows_destroy(kernel_id):
+            self.log.error(
+                "Refusing to shut down kernel %s: another generation owns its lease.",
+                kernel_id,
+            )
+            if kernel_id in self._kernel_adopted:
+                self.abandon_kernel(kernel_id)
+            raise LeaseOwnershipLost(kernel_id)
+
         # Decrease the metric of number of kernels
         # running for the relevant kernel type by 1
         KERNEL_CURRENTLY_RUNNING_TOTAL.labels(type=self._kernels[kernel_id].kernel_name).dec()
@@ -398,6 +712,22 @@ class MappingKernelManager(MultiKernelManager):
         self.stop_watching_activity(kernel_id)
         self.stop_buffering(kernel_id)
 
+        # A kernel adopted during recovery has no provisioner and never
+        # launched its process through this manager; the jupyter_client
+        # shutdown path would no-op (owns_kernel=False) or assert on the
+        # missing provisioner.  Drive the control-channel based shutdown
+        # instead, then drop it from the map.
+        if kernel_id in self._kernel_adopted and not restart:
+            km = self._kernels[kernel_id]
+            await self._adopted_shutdown(km, now=now, restart=restart)
+            self.remove_kernel(kernel_id)
+            self._kernel_adopted.discard(kernel_id)
+            self._kernel_connections.pop(kernel_id, None)
+            self._kernel_ports.pop(kernel_id, None)
+            self._kernel_identities.pop(kernel_id, None)
+            self._kernel_lease_gates.pop(kernel_id, None)
+            return
+
         return await self.pinned_superclass._async_shutdown_kernel(
             self, kernel_id, now=now, restart=restart
         )
@@ -407,7 +737,38 @@ class MappingKernelManager(MultiKernelManager):
     async def _async_restart_kernel(self, kernel_id, now=False):
         """项目内部接口说明。"""
         self._check_kernel_id(kernel_id)
-        await self.pinned_superclass._async_restart_kernel(self, kernel_id, now=now)
+
+        # A kernel adopted after a crash was never launched from this
+        # manager, so jupyter_client's restart path (reuse _launch_args)
+        # cannot work.  Ask the adopted kernel to shut down, drop the
+        # non-owning attachment, and launch a fresh process under our own
+        # ownership with the same kernel id.  The new connection file
+        # yields a new identity, which is recorded in the lease.
+        if kernel_id in self._kernel_adopted:
+            km = self._kernels[kernel_id]
+            kernel_name = km.kernel_name
+            await self._adopted_shutdown(km, now=now, restart=False)
+            self.remove_kernel(kernel_id)
+            self._kernel_adopted.discard(kernel_id)
+            self._kernel_connections.pop(kernel_id, None)
+            self._kernel_ports.pop(kernel_id, None)
+            self._kernel_identities.pop(kernel_id, None)
+            await self._async_start_kernel(kernel_id=kernel_id, kernel_name=kernel_name)
+        else:
+            await self.pinned_superclass._async_restart_kernel(self, kernel_id, now=now)
+        # A restart can rewrite the connection file with different ports;
+        # refresh the identity and tell the lease owner so the persisted
+        # record never lags behind the real kernel.
+        self._kernel_identities[kernel_id] = self.read_kernel_identity(kernel_id) or ""
+        if self._identity_changed_callback is not None:
+            try:
+                result = self._identity_changed_callback(
+                    kernel_id, self._kernel_identities[kernel_id]
+                )
+                if asyncio.iscoroutine(result):
+                    asyncio.ensure_future(result)
+            except Exception:
+                self.log.exception("Identity-changed callback failed for kernel %s", kernel_id)
         kernel = self.get_kernel(kernel_id)
         # return a Future that will resolve when the kernel has successfully restarted
         channel = kernel.connect_shell()
@@ -715,6 +1076,9 @@ class AsyncMappingKernelManager(MappingKernelManager, AsyncMultiKernelManager):
         """项目内部接口说明。"""
         self.pinned_superclass = MultiKernelManager
         self._pending_kernel_tasks = {}
+        self._kernel_identities = getattr(self, "_kernel_identities", None) or {}
+        self._kernel_adopted = getattr(self, "_kernel_adopted", None) or set()
+        self._kernel_lease_gates = getattr(self, "_kernel_lease_gates", None) or {}
         self.pinned_superclass.__init__(self, **kwargs)
         self.last_kernel_activity = utcnow()
 

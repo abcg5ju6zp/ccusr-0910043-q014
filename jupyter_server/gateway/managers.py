@@ -294,6 +294,13 @@ class GatewaySessionManager(SessionManager):
 
     kernel_manager = Instance("jupyter_server.gateway.managers.GatewayMappingKernelManager")
 
+    @default("session_lease_enabled")
+    def _default_session_lease_enabled(self) -> bool:
+        # Kernels live on a remote gateway: local connection-file
+        # fingerprints and heartbeat probes do not apply, so disable
+        # process-local lease recovery for this manager.
+        return False
+
     async def kernel_culled(self, kernel_id: str) -> bool:  # typing: ignore
         """项目内部接口说明。"""
         km: GatewayKernelManager | None = None

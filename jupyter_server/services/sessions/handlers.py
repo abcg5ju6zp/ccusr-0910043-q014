@@ -104,6 +104,10 @@ class SessionRootHandler(SessionsAPIHandler):
                 return
             except DuplicateKernelError as e:
                 raise web.HTTPError(409, str(e)) from e
+            except web.HTTPError:
+                # Ownership/lease conflicts already carry their own
+                # status code (409); do not mask them as a 500.
+                raise
             except Exception as e:
                 raise web.HTTPError(500, str(e)) from e
 
